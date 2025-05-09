@@ -1,0 +1,6 @@
+pickup_zone_encoded
+hour
+day_of_week
+month
+is_weekend
+is_peak_hour
