@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.venv/
+
+# Data and artifacts
+data/*.db
+data/*.sqlite
+data/*.parquet
+data/*.csv
+data/*.zip
+data/tmp/
+models/*.joblib
+
+# Frontend
+frontend/node_modules/
+frontend/build/
+frontend/.env.local
+frontend/.env*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.log
+
+.vscode/
+.idea/
