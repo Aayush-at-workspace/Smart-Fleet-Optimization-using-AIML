@@ -6,6 +6,9 @@ import logging
 from datetime import datetime
 import numpy as np
 from tqdm import tqdm
+from sqlalchemy import create_engine
+from sqlalchemy import text
+from dateutil.parser import isoparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,6 +20,8 @@ class NYCTaxiDataProcessor:
         self.taxi_zones_url = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip"
         self.trip_data_url = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{}.parquet"
         os.makedirs(self.data_dir, exist_ok=True)
+        # Initialize SQLite database engine under data/data.db
+        self.engine = create_engine(f"sqlite:///{os.path.join(self.data_dir, 'data.db')}")
 
     def download_taxi_zones(self):
         """Download NYC taxi zone shapefile"""
@@ -30,9 +35,14 @@ class NYCTaxiDataProcessor:
             
             # Read and process zones
             zones = gpd.read_file(f"zip://{zones_file}")
-            zones_info = zones[['LocationID', 'zone', 'borough']]
-            zones_info.to_csv(os.path.join(self.data_dir, 'taxi_zones.csv'), index=False)
-            logger.info(f"Saved {len(zones_info)} taxi zones")
+            # Calculate centroids
+            zones['centroid_lat'] = zones.geometry.centroid.y
+            zones['centroid_lon'] = zones.geometry.centroid.x
+            # Persist zones to SQL (replace existing table) with centroids included
+            zones_info = zones[['LocationID', 'zone', 'borough', 'centroid_lat', 'centroid_lon']]
+            zones_info.to_sql('taxi_zones', self.engine, if_exists='replace', index=False)
+            # zones_info.to_csv(os.path.join(self.data_dir, 'taxi_zones.csv'), index=False)
+            logger.info(f"Saved {len(zones_info)} taxi zones with centroids")
             return zones_info
         except Exception as e:
             logger.error(f"Error downloading taxi zones: {str(e)}")
@@ -74,6 +84,8 @@ class NYCTaxiDataProcessor:
             
             if all_trips:
                 combined_trips = pd.concat(all_trips, ignore_index=True)
+                # Persist combined trips to SQL (replace existing table). CSV writes are intentionally omitted.
+                combined_trips.to_sql('trips', self.engine, if_exists='replace', index=False)
                 return combined_trips
             else:
                 raise Exception("No trip data could be downloaded")
@@ -82,100 +94,39 @@ class NYCTaxiDataProcessor:
             logger.error(f"Error in download_trip_data: {str(e)}")
             raise
 
-    def process_trip_data(self, trips_df, zones_df):
-        """Process and clean the trip data"""
+    def preview_table(self, table_name='trips'):
+        """Print first 10 rows and total count for a table stored in the SQL database"""
         try:
-            logger.info("Processing trip data...")
-            
-            # Merge with zone information
-            trips_df = trips_df.merge(
-                zones_df[['LocationID', 'zone']].rename(columns={'LocationID': 'pickup_zone_id', 'zone': 'pickup_zone'}),
-                on='pickup_zone_id'
-            ).merge(
-                zones_df[['LocationID', 'zone']].rename(columns={'LocationID': 'drop_zone_id', 'zone': 'drop_zone'}),
-                on='drop_zone_id'
-            )
-            
-            # Add temporal features
-            trips_df['hour'] = trips_df['pickup_time'].dt.hour
-            trips_df['day_of_week'] = trips_df['pickup_time'].dt.dayofweek
-            
-            # Group by pickup zone, drop zone, hour, and day of week to get demand patterns
-            demand_patterns = trips_df.groupby(
-                ['pickup_zone', 'drop_zone', 'hour', 'day_of_week']
-            ).agg({
-                'pickup_time': 'count',  # Count trips as demand
-                'no_of_passengers': 'mean'
-            }).reset_index()
-            
-            demand_patterns.rename(columns={'pickup_time': 'no_of_bookings'}, inplace=True)
-            
-            # Save processed data
-            demand_patterns.to_csv(os.path.join(self.data_dir, 'historical_rides.csv'), index=False)
-            trips_df.to_csv(os.path.join(self.data_dir, 'current_rides.csv'), index=False)
-            
-            logger.info(f"Processed {len(trips_df)} trips into {len(demand_patterns)} demand patterns")
-            return demand_patterns
-            
+            logger.info(f"Previewing table: {table_name}")
+            # Show first 10 rows
+            head_df = pd.read_sql(f"SELECT * FROM {table_name} LIMIT 10", self.engine)
+            pd.set_option('display.max_columns', None)
+            print(head_df)
+            print("Columns:", head_df.columns)
+            # Show total count
+            count_df = pd.read_sql(f"SELECT COUNT(*) as count FROM {table_name}", self.engine)
+            total = int(count_df['count'].iloc[0])
+            print(f"Total rows in {table_name}: {total}")
+            return head_df, total
         except Exception as e:
-            logger.error(f"Error processing trip data: {str(e)}")
-            raise
-
-    def create_sample_current_rides(self, zones_df, n_samples=1000):
-        """Create sample current rides based on zone patterns"""
-        try:
-            logger.info("Generating sample current rides...")
-            
-            zones = zones_df['zone'].unique()
-            now = pd.Timestamp.now()
-            
-            current_rides = []
-            for _ in range(n_samples):
-                pickup_zone = np.random.choice(zones)
-                drop_zone = np.random.choice([z for z in zones if z != pickup_zone])
-                
-                # Random time in next 24 hours
-                pickup_time = now + pd.Timedelta(minutes=np.random.randint(0, 24*60))
-                
-                current_rides.append({
-                    'pickup_zone': pickup_zone,
-                    'drop_zone': drop_zone,
-                    'pickup_time': pickup_time,
-                    'no_of_passengers': np.random.randint(1, 5)
-                })
-            
-            current_rides_df = pd.DataFrame(current_rides)
-            current_rides_df.to_csv(os.path.join(self.data_dir, 'rides.csv'), index=False)
-            logger.info(f"Generated {len(current_rides_df)} sample current rides")
-            
-        except Exception as e:
-            logger.error(f"Error creating sample rides: {str(e)}")
+            logger.error(f"Error previewing table '{table_name}': {str(e)}")
             raise
 
 def main():
     try:
         processor = NYCTaxiDataProcessor()
-        
         # Download and process taxi zones
         zones_df = processor.download_taxi_zones()
-        
         # Download recent trip data (last 3 months of 2023 for example)
-        trips_df = processor.download_trip_data(
-            year=2023,
-            months=range(10, 13)  # October to December
-        )
-        
-        # Process historical data
-        demand_patterns = processor.process_trip_data(trips_df, zones_df)
-        
-        # Create sample current rides
-        processor.create_sample_current_rides(zones_df)
-        
+         trips_df = processor.download_trip_data(year=2023, months=range(10, 13))
+        # Preview stored SQL tables
+        processor.preview_table('taxi_zones')
+        processor.preview_table('trips')
+        processor.preview_table('new_rides')
         logger.info("Data preparation completed successfully!")
-        
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         raise
 
 if __name__ == '__main__':
-    main() 
+    main()

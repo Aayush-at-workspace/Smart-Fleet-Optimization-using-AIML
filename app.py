@@ -1,201 +1,159 @@
-from flask import Flask, request, jsonify, render_template
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import joblib
-import os
+from flask import Flask, request, jsonify
 import logging
+import os
+import sqlite3
+from dateutil.parser import isoparse
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Load the trained model and encoder
-try:
-    model = joblib.load('models/demand_predictor.joblib')
-    zone_encoder = joblib.load('models/zone_encoder.joblib')
-    
-    # Load feature list
-    with open('models/feature_list.txt', 'r') as f:
-        feature_list = f.read().splitlines()
-    
-    logger.info("Successfully loaded ML model and encoder")
-except Exception as e:
-    logger.error(f"Error loading ML model or encoder: {str(e)}")
-    model = None
-    zone_encoder = None
-    feature_list = None
-
-def load_rides():
-    """Load and preprocess active rides data"""
-    try:
-        rides_df = pd.read_csv('rides.csv')
-        rides_df['pickup_time'] = pd.to_datetime(rides_df['pickup_time'])
-        return rides_df
-    except Exception as e:
-        logger.error(f"Error loading rides data: {str(e)}")
-        return pd.DataFrame()
-
-def find_return_matches(drop_location, pickup_location, drop_time, time_window=1.5):
-    """Find potential return trip matches"""
-    try:
-        rides_df = load_rides()
-        if rides_df.empty:
-            return []
-
-        window_end = pd.to_datetime(drop_time) + timedelta(hours=time_window)
-        
-        matches = rides_df[
-            (rides_df['pickup_zone'] == drop_location) &
-            (rides_df['drop_zone'] == pickup_location) &
-            (rides_df['pickup_time'] >= pd.to_datetime(drop_time)) &
-            (rides_df['pickup_time'] <= window_end)
-        ].sort_values('pickup_time')
-
-        return matches.to_dict('records')
-    except Exception as e:
-        logger.error(f"Error finding return matches: {str(e)}")
-        return []
-
-def predict_zone_demand(zone, hour, day_of_week):
-    """Predict demand for a given zone at specific time"""
-    try:
-        if model is None or zone_encoder is None:
-            return 0.0
-        
-        # Create feature vector
-        features = pd.DataFrame({
-            'pickup_zone_encoded': [zone_encoder.transform([zone])[0]],
-            'hour': [hour],
-            'day_of_week': [day_of_week],
-            'month': [datetime.now().month],
-            'is_weekend': [1 if day_of_week in [5, 6] else 0],
-            'is_peak_hour': [1 if hour in [8, 9, 17, 18, 19] else 0]
-        })
-        
-        # Ensure features are in the correct order
-        features = features[feature_list]
-        
-        prediction = model.predict(features)[0]
-        return float(prediction)
-    except Exception as e:
-        logger.error(f"Error predicting demand: {str(e)}")
-        return 0.0
-
 @app.route('/')
 def home():
-    """Render the main dashboard"""
-    return render_template('index.html')
+    return jsonify({"message": "Smart Fleet Optimization API", "status": "running"})
+
+@app.route('/zones', methods=['GET'])
+def zones():
+    """Return list of zones with ids and names from SQLite or CSV fallback."""
+    zones_list = []
+    try:
+        db_path = os.path.join('data', 'data.db')
+        if os.path.exists(db_path):
+            with sqlite3.connect(db_path) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT LocationID, zone, borough FROM taxi_zones')
+                rows = cur.fetchall()
+                zones_list = [{"id": r[0], "zone": r[1], "borough": r[2]} for r in rows]
+        else:
+            raise FileNotFoundError('data.db not found')
+    except Exception as e:
+        logger.warning("/zones DB lookup failed (%s). Falling back to CSV.", e)
+        csv_path = os.path.join('data', 'taxi_zones.csv')
+        if os.path.exists(csv_path):
+            try:
+                import pandas as pd
+                df = pd.read_csv(csv_path)
+                for _, r in df.iterrows():
+                    zones_list.append({"id": int(r.get('LocationID')), "zone": r.get('zone'), "borough": r.get('borough')})
+            except Exception as e2:
+                logger.error("/zones CSV read failed: %s", e2)
+    return jsonify({"zones": zones_list})
 
 @app.route('/complete_ride', methods=['POST'])
 def complete_ride():
-    """Handle ride completion and return suggestions"""
+    data = request.get_json(silent=True) or {}
+    logger.info("Received /complete_ride payload: %s", data)
+
+    # Validate required inputs
+    required = ['pickup', 'drop', 'pickup_time', 'drop_time', 'passengers']
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    pickup_name = str(data.get('pickup')).strip()
+    drop_name = str(data.get('drop')).strip()
+    pickup_time = str(data.get('pickup_time')).strip()
+    drop_time = str(data.get('drop_time')).strip()
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                "error": "No data provided in request"
-            }), 400
-        
-        # Validate required fields
-        required_fields = ['cab_id', 'pickup', 'drop', 'drop_time']
-        missing_fields = [field for field in required_fields if field not in data]
-        if missing_fields:
-            return jsonify({
-                "error": f"Missing required fields: {', '.join(missing_fields)}"
-            }), 400
+        passengers = int(data.get('passengers'))
+    except Exception:
+        return jsonify({"error": "passengers must be an integer"}), 400
 
-        # Validate locations
-        valid_locations = ['Delhi', 'Noida', 'Gurgaon', 'Saket', 'Faridabad']
-        if data['pickup'] not in valid_locations:
-            return jsonify({
-                "error": f"Invalid pickup location. Must be one of: {', '.join(valid_locations)}"
-            }), 400
-        
-        if data['drop'] not in valid_locations:
-            return jsonify({
-                "error": f"Invalid drop location. Must be one of: {', '.join(valid_locations)}"
-            }), 400
-
-        if data['pickup'] == data['drop']:
-            return jsonify({
-                "error": "Pickup and drop locations cannot be the same"
-            }), 400
-
-        # Parse drop time
+    # Build zone name -> id mapping
+    name_to_id = {}
+    db_path = os.path.join('data', 'data.db')
+    if os.path.exists(db_path):
         try:
-            drop_time = datetime.fromisoformat(data['drop_time'].replace('Z', '+00:00'))
-        except ValueError:
-            return jsonify({
-                "error": "Invalid drop_time format. Use ISO format (YYYY-MM-DDTHH:MM:SS)"
-            }), 400
+            with sqlite3.connect(db_path) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT LocationID, zone FROM taxi_zones')
+                for loc_id, zone in cur.fetchall():
+                    name_to_id[str(zone).strip().lower()] = int(loc_id)
+        except Exception as e:
+            logger.warning("Failed reading taxi_zones from DB: %s", e)
+    # CSV fallback
+    if not name_to_id:
+        csv_path = os.path.join('data', 'taxi_zones.csv')
+        if os.path.exists(csv_path):
+            try:
+                import pandas as pd
+                dfz = pd.read_csv(csv_path)
+                for _, r in dfz.iterrows():
+                    name_to_id[str(r.get('zone')).strip().lower()] = int(r.get('LocationID'))
+            except Exception as e:
+                logger.error("Failed reading taxi_zones.csv: %s", e)
 
-        # Look for return trip matches
-        matches = find_return_matches(
-            data['drop'],
-            data['pickup'],
-            drop_time
+    pickup_zone_id = name_to_id.get(pickup_name.lower())
+    drop_zone_id = name_to_id.get(drop_name.lower())
+    if pickup_zone_id is None or drop_zone_id is None:
+        return jsonify({"error": "Unknown pickup or drop zone name"}), 400
+
+    # Insert into new_rides table and fetch the inserted row
+    os.makedirs('data', exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            'CREATE TABLE IF NOT EXISTS new_rides ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'pickup_time TEXT NOT NULL,'
+            'dropoff_time TEXT NOT NULL,'
+            'pickup_zone_id INTEGER NOT NULL,'
+            'drop_zone_id INTEGER NOT NULL,'
+            'no_of_passengers INTEGER NOT NULL)'
         )
+        cur.execute(
+            'INSERT INTO new_rides (pickup_time, dropoff_time, pickup_zone_id, drop_zone_id, no_of_passengers) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (pickup_time, drop_time, pickup_zone_id, drop_zone_id, passengers)
+        )
+        inserted_id = cur.lastrowid
+        conn.commit()
+        cur.execute('SELECT id, pickup_time, dropoff_time, pickup_zone_id, drop_zone_id, no_of_passengers '
+                    'FROM new_rides WHERE id = ?', (inserted_id,))
+        row = cur.fetchone()
 
-        if matches:
-            # Return the best match
-            best_match = matches[0]
-            return jsonify({
-                "status": "match found",
-                "ride_details": {
-                    "pickup": best_match['pickup_zone'],
-                    "drop": best_match['drop_zone'],
-                    "pickup_time": best_match['pickup_time'].isoformat(),
-                    "passengers": best_match['no_of_passengers']
-                }
+    # Print/log the inserted row
+    logger.info("Inserted new_ride row: %s", row)
+
+    # --- Call the top-k prediction function and return with response ---
+    recommendations = []
+    try:
+        from train_model import get_top3_closest_highprob_zones
+        top_df = get_top3_closest_highprob_zones(drop_zone_id, isoparse(drop_time))
+
+        # Build id -> zone name mapping
+        id_to_zone = {}
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT LocationID, zone FROM taxi_zones')
+                for loc_id, zone in cur.fetchall():
+                    id_to_zone[int(loc_id)] = str(zone)
+        except Exception as e:
+            logger.warning("Failed reading taxi_zones for name mapping: %s", e)
+
+        for rec in top_df.to_dict(orient='records'):
+            zid = int(rec.get('pickup_zone_id')) if rec.get('pickup_zone_id') is not None else None
+            recommendations.append({
+                "id": zid,
+                "name": id_to_zone.get(zid, f"Zone {zid}" if zid is not None else "Unknown"),
+                "probability": float(rec.get('probability', 0.0)),
+                "distance": float(rec.get('distance', 0.0))
             })
 
-        # If no match, predict demand for nearby zones
-        zones = ['Delhi', 'Noida', 'Gurgaon', 'Saket', 'Faridabad']
-        current_hour = drop_time.hour
-        current_day = drop_time.weekday()
-
-        predictions = []
-        for zone in zones:
-            score = predict_zone_demand(zone, current_hour, current_day)
-            predictions.append({
-                "zone": zone,
-                "score": score
-            })
-
-        # Sort predictions by score and get top 3
-        predictions.sort(key=lambda x: x['score'], reverse=True)
-        top_predictions = predictions[:3]
-
-        return jsonify({
-            "status": "no match found",
-            "suggested_zones": top_predictions
-        })
-
+        logger.info("Top recommended zones: %s", recommendations)
+        print("Top recommended zones:", recommendations)
     except Exception as e:
-        logger.error(f"Error processing ride completion: {str(e)}")
-        return jsonify({
-            "error": "Internal server error",
-            "details": str(e)
-        }), 500
+        logger.error("Error getting top recommended zones: %s", e)
+
+    # Return the inserted row and recommendations as JSON
+    keys = ['id', 'pickup_time', 'dropoff_time', 'pickup_zone_id', 'drop_zone_id', 'no_of_passengers']
+    return jsonify({"new_ride": dict(zip(keys, row)), "recommendations": recommendations})
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    status = {
-        "status": "healthy",
-        "components": {
-            "model": "loaded" if model is not None else "not loaded",
-            "database": "connected" if not load_rides().empty else "error"
-        },
-        "timestamp": datetime.now().isoformat()
-    }
-    return jsonify(status)
+def health():
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000) 
