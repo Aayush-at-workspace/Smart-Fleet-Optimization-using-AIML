@@ -66,3 +66,19 @@ A comprehensive AI-powered fleet optimization platform that uses machine learnin
 ## Project Structure 
   
 The project combines a Flask backend with machine learning algorithms and a React frontend to create an intelligent system for fleet management. The system analyzes historical trip data, predicts demand patterns, and provides real-time optimization recommendations for taxi drivers and fleet operators. 
+
+## 🚀 Quick Start with Docker
+
+1. Build the Docker image:
+   ```bash
+   docker build -t smart-fleet-app .
+   ```
+
+2. Run the container:
+   ```bash
+   docker run -d -p 5000:5000 --name smart-fleet-container smart-fleet-app
+   ```
+
+3. Visit [http://localhost:5000](http://localhost:5000) in your browser.
+
+For more details, see [DOCKER_SETUP.md](./DOCKER_SETUP.md).

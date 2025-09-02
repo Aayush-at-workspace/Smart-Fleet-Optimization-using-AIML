@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import logging
 import os
 import sqlite3
@@ -7,11 +7,7 @@ from dateutil.parser import isoparse
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({"message": "Smart Fleet Optimization API", "status": "running"})
+app = Flask(__name__, static_folder='frontend/build', static_url_path='')
 
 @app.route('/zones', methods=['GET'])
 def zones():
@@ -154,6 +150,18 @@ def complete_ride():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
+
+# Serve React app for all non-API routes
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    # Skip static files and API routes
+    if path.startswith('static/') or path.startswith('api/') or path.startswith('zones') or path.startswith('complete_ride') or path.startswith('health'):
+        # Let Flask handle these routes normally
+        return app.send_static_file(path)
+    
+    # For any other route, serve the React app
+    return app.send_static_file('index.html')
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000) 
